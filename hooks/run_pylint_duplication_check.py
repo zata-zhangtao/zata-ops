@@ -16,8 +16,8 @@ from duplication_check_utils import (
 )
 
 PYTHON_SUFFIXES: set[str] = {".py"}
-BACKEND_ROOTS: list[Path] = [Path("src/backend")]
-PYTHON_CORPUS_ROOTS: list[Path] = [Path("src/backend")]
+BACKEND_ROOTS: list[Path] = [Path("src/zata_ops")]
+PYTHON_CORPUS_ROOTS: list[Path] = [Path("src/zata_ops")]
 PYLINT_DUPLICATE_REF_RE = re.compile(
     r"==(?P<module>[A-Za-z_][A-Za-z0-9_.]*):\[(?P<start>\d+):(?P<end>\d+)\]"
 )

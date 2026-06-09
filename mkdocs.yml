@@ -40,6 +40,7 @@ nav:
       - 备份与恢复: guides/backup-and-restore.md
       - 调度示例: guides/scheduling.md
       - VPS 初始化: guides/vps-provisioning.md
+      - SSH 隧道: guides/tunnel.md
   - AI 规范:
       - 概览: ai-standards/index.md
       - 架构规范: ai-standards/architecture.md

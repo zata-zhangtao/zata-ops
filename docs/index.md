@@ -9,6 +9,7 @@ Shared operations toolkit CLI for Zata downstream projects.
 - `db migrate` — PostgreSQL data migration (not Alembic).
 - `env provision` / `env fix` — VPS + Traefik bootstrap and ACME repair.
 - `logs tail` / `logs search` — Docker and systemd log inspection.
+- `tunnel open` / `tunnel list` / `tunnel close` — SSH port forwarding (local/remote) with foreground or daemonised background mode.
 - `dashboard` — terminal status snapshot.
 
 Install:

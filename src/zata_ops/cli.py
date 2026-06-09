@@ -15,6 +15,7 @@ from zata_ops.db import cli as db_cli
 from zata_ops.env import cli as env_cli
 from zata_ops.logs import cli as logs_cli
 from zata_ops.observability import cli as observability_cli
+from zata_ops.tunnel import cli as tunnel_cli
 
 app: typer.Typer = typer.Typer(
     name="zata-ops",
@@ -34,6 +35,11 @@ app.add_typer(env_cli.app, name="env", help="VPS environment provisioning and fi
 app.add_typer(logs_cli.app, name="logs", help="Tail and search container/system logs.")
 app.add_typer(
     observability_cli.app, name="dashboard", help="Terminal status dashboard."
+)
+app.add_typer(
+    tunnel_cli.app,
+    name="tunnel",
+    help=("SSH 端口转发(local 对应 ssh -L,remote 对应 ssh -R)," "前台常驻或后台守护。"),
 )
 
 

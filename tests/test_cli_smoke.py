@@ -23,7 +23,7 @@ def test_root_help_lists_all_subcommands() -> None:
     runner = CliRunner()
     help_result = runner.invoke(app, ["--help"])
     assert help_result.exit_code == 0
-    for subcommand_name in ("db", "env", "logs", "dashboard"):
+    for subcommand_name in ("db", "env", "logs", "dashboard", "tunnel"):
         assert subcommand_name in help_result.stdout
 
 
@@ -49,6 +49,14 @@ def test_logs_help_lists_subcommands() -> None:
     assert logs_help_result.exit_code == 0
     assert "tail" in logs_help_result.stdout
     assert "search" in logs_help_result.stdout
+
+
+def test_tunnel_help_lists_baseline_subcommands() -> None:
+    runner = CliRunner()
+    tunnel_help_result = runner.invoke(app, ["tunnel", "--help"])
+    assert tunnel_help_result.exit_code == 0
+    for tunnel_command_name in ("open", "list", "status", "close"):
+        assert tunnel_command_name in tunnel_help_result.stdout
 
 
 def test_dashboard_mock_renders() -> None:

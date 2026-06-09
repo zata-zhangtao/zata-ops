@@ -1,0 +1,1 @@
+"""Observability commands (terminal dashboard)."""

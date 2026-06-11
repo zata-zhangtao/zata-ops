@@ -177,7 +177,10 @@ def collect_options(prefill: _runner.TunnelOptions) -> _runner.TunnelOptions:
     )
     if not ssh_host:
         raise _runner.TunnelError("--ssh-host 不能为空")
-    ssh_user = _ask_ssh_user() if not prefill.ssh_user else prefill.ssh_user
+    if prefill.ssh_user:
+        ssh_user = _ask_text("SSH 用户名?", prefill.ssh_user)
+    else:
+        ssh_user = _ask_ssh_user()
     ssh_port = _ask_int_port(
         "SSH 服务端口?",
         prefill.ssh_port or 22,

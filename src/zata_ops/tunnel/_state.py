@@ -339,3 +339,43 @@ def mark_state(name: str, new_state: str) -> None:
 def now_iso() -> str:
     """Return the current UTC time formatted as ISO 8601 with seconds."""
     return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat()
+
+
+#: 历史记录文件名，用于保存最近一次成功的 ``tunnel open`` 参数。
+HISTORY_FILE_NAME: str = "last_open.json"
+
+
+def history_path() -> Path:
+    """Return the path to the last-open history file."""
+    return state_dir() / HISTORY_FILE_NAME
+
+
+def write_history(payload: dict[str, Any]) -> Path:
+    """Persist the last successful ``tunnel open`` options (sans password).
+
+    Args:
+        payload: JSON-serializable dict of tunnel options.
+
+    Returns:
+        Path to the written history file.
+    """
+    target_path = history_path()
+    json_payload = json.dumps(payload, indent=2, ensure_ascii=False)
+    target_path.write_text(json_payload + "\n", encoding="utf-8")
+    return target_path
+
+
+def read_history() -> dict[str, Any] | None:
+    """Load the last successful ``tunnel open`` options if present.
+
+    Returns:
+        Decoded dict, or ``None`` if the file is missing or unreadable.
+    """
+    target_path = history_path()
+    if not target_path.is_file():
+        return None
+    try:
+        raw_text = target_path.read_text(encoding="utf-8")
+        return json.loads(raw_text)
+    except (OSError, json.JSONDecodeError):
+        return None

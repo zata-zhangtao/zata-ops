@@ -10,6 +10,7 @@ GatewayPorts denial path.
 from __future__ import annotations
 
 import json
+import os
 from unittest import mock
 
 import paramiko
@@ -383,3 +384,188 @@ def test_dry_run_plan_mentions_gateway_ports_for_remote_non_loopback() -> None:
     plan_payload = _extract_dry_run_plan(result.stdout)
     requirements = plan_payload["server_requirements"]
     assert any("GatewayPorts" in req for req in requirements)
+
+
+def test_open_last_without_history_exits_1(monkeypatch, tmp_path) -> None:
+    """``--last`` when no history exists exits with code 1 and prints a hint."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    runner = CliRunner()
+    result = runner.invoke(app, ["tunnel", "open", "--last"])
+    assert result.exit_code == 1
+    assert "历史" in result.output or "history" in result.output.lower()
+
+
+def test_open_last_with_history_reuses_params(monkeypatch, tmp_path) -> None:
+    """``--last`` reads history and produces the same dry-run plan."""
+    from zata_ops.tunnel import _state
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    _state.write_history(
+        {
+            "direction": "local",
+            "ssh_host": "historical.bastion",
+            "ssh_user": "history_user",
+            "ssh_port": 2222,
+            "ssh_key": "/home/hist/.ssh/id_rsa",
+            "bind_host": "127.0.0.1",
+            "bind_port": 19999,
+            "target_host": "hist.db",
+            "target_port": 3306,
+            "strict_host_key": True,
+            "background": False,
+            "reconnect": True,
+            "max_reconnect": 3,
+        }
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["tunnel", "open", "--last", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    plan_payload = _extract_dry_run_plan(result.stdout)
+    assert plan_payload["direction"] == "local"
+    assert plan_payload["ssh"]["host"] == "historical.bastion"
+    assert plan_payload["ssh"]["user"] == "history_user"
+    assert plan_payload["ssh"]["port"] == 2222
+    assert plan_payload["listen"]["port"] == 19999
+    assert plan_payload["target"]["host"] == "hist.db"
+    assert plan_payload["target"]["port"] == 3306
+
+
+def test_open_last_with_override_merges(monkeypatch, tmp_path) -> None:
+    """``--last`` combined with explicit flags merges history + overrides."""
+    from zata_ops.tunnel import _state
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    _state.write_history(
+        {
+            "direction": "local",
+            "ssh_host": "historical.bastion",
+            "ssh_user": "history_user",
+            "ssh_port": 22,
+            "ssh_key": None,
+            "bind_host": "127.0.0.1",
+            "bind_port": 19000,
+            "target_host": "127.0.0.1",
+            "target_port": 5432,
+            "strict_host_key": False,
+            "background": False,
+            "reconnect": False,
+            "max_reconnect": 0,
+        }
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "tunnel",
+            "open",
+            "--last",
+            "--bind-port",
+            "20000",
+            "--target-port",
+            "3306",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    plan_payload = _extract_dry_run_plan(result.stdout)
+    assert plan_payload["ssh"]["host"] == "historical.bastion"
+    assert plan_payload["listen"]["port"] == 20000  # overridden
+    assert plan_payload["target"]["port"] == 3306  # overridden
+
+
+def test_open_from_missing_spec_exits_1(monkeypatch, tmp_path) -> None:
+    """``--from`` with a non-existent name exits with code 1."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    runner = CliRunner()
+    result = runner.invoke(app, ["tunnel", "open", "--from", "ghost"])
+    assert result.exit_code == 1
+    assert "ghost" in result.output
+
+
+def test_open_from_existing_spec_copies_params(monkeypatch, tmp_path) -> None:
+    """``--from`` copies an existing background spec into the new command."""
+    from zata_ops.tunnel import _state
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    existing = _state.TunnelSpec(
+        name="existing",
+        direction="remote",
+        bind_host="0.0.0.0",
+        bind_port=8080,
+        target_host="127.0.0.1",
+        target_port=3000,
+        ssh_host="remote.bastion",
+        ssh_user="remote_user",
+        ssh_port=2222,
+        ssh_key="/key",
+        strict_host_key=True,
+        pid=os.getpid(),
+        log_path="",
+        started_at="2026-06-09T16:00:00+00:00",
+        state="ready",
+        reconnect=True,
+        max_reconnect=10,
+    )
+    _state.write_spec(existing)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tunnel", "open", "--from", "existing", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    plan_payload = _extract_dry_run_plan(result.stdout)
+    assert plan_payload["direction"] == "remote"
+    assert plan_payload["ssh"]["host"] == "remote.bastion"
+    assert plan_payload["ssh"]["user"] == "remote_user"
+    assert plan_payload["ssh"]["port"] == 2222
+    assert plan_payload["listen"]["port"] == 8080
+    assert plan_payload["target"]["port"] == 3000
+
+
+def test_open_from_with_override_merges(monkeypatch, tmp_path) -> None:
+    """``--from`` combined with explicit flags merges spec + overrides."""
+    from zata_ops.tunnel import _state
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    existing = _state.TunnelSpec(
+        name="existing",
+        direction="local",
+        bind_host="127.0.0.1",
+        bind_port=9000,
+        target_host="db",
+        target_port=5432,
+        ssh_host="bastion",
+        ssh_user="ops",
+        ssh_port=22,
+        ssh_key=None,
+        strict_host_key=False,
+        pid=os.getpid(),
+        log_path="",
+        started_at="",
+        state="ready",
+        reconnect=False,
+        max_reconnect=0,
+    )
+    _state.write_spec(existing)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "tunnel",
+            "open",
+            "--from",
+            "existing",
+            "--bind-port",
+            "9999",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    plan_payload = _extract_dry_run_plan(result.stdout)
+    assert plan_payload["ssh"]["host"] == "bastion"
+    assert plan_payload["listen"]["port"] == 9999  # overridden
+
+
+def test_open_last_and_from_mutual_exclusion() -> None:
+    """``--last`` and ``--from`` together exit with code 2."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["tunnel", "open", "--last", "--from", "x"])
+    assert result.exit_code == 2
+    assert "last" in result.output and "from" in result.output

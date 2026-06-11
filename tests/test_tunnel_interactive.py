@@ -257,7 +257,6 @@ def test_collect_options_uses_prefill_for_partial_input(monkeypatch) -> None:
     )
     # Replace each ask helper so the form short-circuits to prefill values.
     monkeypatch.setattr(_interactive, "_ask_direction", lambda: prefill.direction)
-    monkeypatch.setattr(_interactive, "_ask_ssh_user", lambda: prefill.ssh_user)
     monkeypatch.setattr(_interactive, "_ask_optional_ssh_key", lambda: prefill.ssh_key)
     monkeypatch.setattr(_interactive, "_ask_text", lambda prompt, default: default)
     monkeypatch.setattr(_interactive, "_ask_int_port", lambda prompt, default: default)

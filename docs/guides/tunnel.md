@@ -80,6 +80,9 @@ $ zata-ops tunnel open
 - **端口范围** 1-65535,超出会被 questionary 的 `validate` 拒绝,无法继续。
 - 传了任何 flag(包括 `--direction`)就**不**进表单,与显式调用习惯一致。
 - 表单最后会问"先 dry-run 预览吗?",默认 Yes(推荐新用户先看 plan)。
+- **历史预填**:只要之前成功执行过 `tunnel open`,交互表单会自动用
+  上一次的值作为默认值(方括号内显示),直接回车即可保留。参见下方
+  `--last` / `--from` 章节。
 
 ## 快速开始
 
@@ -145,6 +148,74 @@ zata-ops tunnel open \
 
 执行后,远端的 `127.0.0.1:8080` 会被打回到你本机的 `127.0.0.1:3000`。
 适合临时给同事/远端测试机器访问你的本地 dev 服务。
+
+### 4. 复用已有参数 (`--last` / `--from`)
+
+如果你经常连同一套跳板机+端口,每次重输参数很烦。`tunnel open` 支持三种复用方式:
+
+#### 交互模式自动预填 (默认)
+
+只要之前成功执行过 `tunnel open`,下次**不传 `--direction`** 进入交互表单时,
+所有字段都会自动显示上一次的值作为默认值,直接回车即可保留,
+只需改变化的部分:
+
+```bash
+$ zata-ops tunnel open
+? 隧道方向(对应 ssh -L 还是 ssh -R)? [local]:
+? SSH 跳板机地址? [bastion.example.com]:
+? SSH 用户名? [ops]:
+? 监听端口? [19000]: 3307   # <-- 只改端口,其余回车
+...
+```
+
+#### `--last`: 一键复用上一次完整配置
+
+```bash
+# 完全复用上一次参数直接启动
+zata-ops tunnel open --last
+
+# 复用上一次参数,但覆盖监听端口
+zata-ops tunnel open --last --bind-port 3307
+
+# 复用上一次参数,但改为后台模式并命名
+zata-ops tunnel open --last --background --name db-prod
+```
+
+规则:
+
+- `--last` 读取 `~/.local/share/zata-ops/tunnels/last_open.json`,
+  这是每次成功 `tunnel open` 后自动保存的参数快照(**不含密码**)。
+- 与显式 flag 同时出现时,显式 flag 优先覆盖历史值。
+- 没有历史记录时用 `--last` 会提示并退出码 1。
+
+#### `--from`: 从已有后台隧道复制配置
+
+```bash
+# 基于后台隧道 "db-access" 的配置,微调端口后前台启动
+zata-ops tunnel open --from db-access --bind-port 3308
+
+# 基于已有配置,但改为远端方向并暴露给外部
+zata-ops tunnel open --from dev-server --direction remote --bind-host 0.0.0.0
+```
+
+规则:
+
+- `--from <name>` 读取该后台隧道的 spec 文件,复制除 `name`、`background`
+  和 `ssh_password` 之外的所有字段。
+- 与显式 flag 同时出现时,显式 flag 优先覆盖。
+- 引用的 spec 不存在时退出码 1。
+
+#### 互斥与合并逻辑
+
+`--last` 与 `--from` **不能同时使用**,否则会退出码 2 并提示。
+合并优先级:
+
+```
+显式 CLI flag > --from / --last 历史值 > 系统默认值
+```
+
+例如 `--last --bind-port 3307` 会保留历史中的 `ssh_host`、`ssh_user` 等,
+但监听端口强制改为 `3307`。
 
 ## 鉴权
 

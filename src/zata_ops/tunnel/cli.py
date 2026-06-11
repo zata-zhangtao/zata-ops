@@ -18,7 +18,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -134,6 +134,87 @@ def _default_name(direction: str) -> str:
     return f"{direction}-{timestamp}"
 
 
+def _options_from_history(history: dict[str, Any]) -> _runner.TunnelOptions:
+    """Build :class:`TunnelOptions` from a history dict."""
+    return _runner.TunnelOptions(
+        direction=history.get("direction", ""),
+        ssh_host=history.get("ssh_host", ""),
+        ssh_user=history.get("ssh_user", ""),
+        ssh_port=history.get("ssh_port", 22),
+        ssh_key=history.get("ssh_key"),
+        bind_host=history.get("bind_host", "127.0.0.1"),
+        bind_port=history.get("bind_port", 0),
+        target_host=history.get("target_host", "127.0.0.1"),
+        target_port=history.get("target_port", 0),
+        strict_host_key=history.get("strict_host_key", False),
+        name="",
+        background=history.get("background", False),
+        dry_run=False,
+        ssh_password=None,
+        reconnect=history.get("reconnect", False),
+        max_reconnect=history.get("max_reconnect", 0),
+    )
+
+
+def _options_from_spec(name: str) -> _runner.TunnelOptions:
+    """Build :class:`TunnelOptions` from an existing background tunnel spec."""
+    spec = _state.load_spec(name)
+    return _runner.TunnelOptions(
+        direction=spec.direction,
+        ssh_host=spec.ssh_host,
+        ssh_user=spec.ssh_user,
+        ssh_port=spec.ssh_port,
+        ssh_key=spec.ssh_key,
+        bind_host=spec.bind_host,
+        bind_port=spec.bind_port,
+        target_host=spec.target_host,
+        target_port=spec.target_port,
+        strict_host_key=spec.strict_host_key,
+        name="",
+        background=False,
+        dry_run=False,
+        ssh_password=None,
+        reconnect=spec.reconnect,
+        max_reconnect=spec.max_reconnect,
+    )
+
+
+def _overlay_options(
+    base: _runner.TunnelOptions, override: _runner.TunnelOptions
+) -> _runner.TunnelOptions:
+    """Merge two options, taking override's non-default values."""
+    return _runner.TunnelOptions(
+        direction=override.direction or base.direction,
+        ssh_host=override.ssh_host or base.ssh_host,
+        ssh_user=(
+            override.ssh_user
+            if override.ssh_user != _resolve_ssh_user("")
+            else base.ssh_user
+        ),
+        ssh_port=override.ssh_port if override.ssh_port != 22 else base.ssh_port,
+        ssh_key=override.ssh_key if override.ssh_key is not None else base.ssh_key,
+        bind_host=override.bind_host
+        if override.bind_host != "127.0.0.1"
+        else base.bind_host,
+        bind_port=override.bind_port if override.bind_port != 0 else base.bind_port,
+        target_host=override.target_host
+        if override.target_host != "127.0.0.1"
+        else base.target_host,
+        target_port=override.target_port
+        if override.target_port != 0
+        else base.target_port,
+        strict_host_key=override.strict_host_key or base.strict_host_key,
+        name=override.name or base.name,
+        background=override.background or base.background,
+        dry_run=override.dry_run or base.dry_run,
+        ssh_password=override.ssh_password or base.ssh_password,
+        reconnect=override.reconnect or base.reconnect,
+        max_reconnect=override.max_reconnect
+        if override.max_reconnect != 0
+        else base.max_reconnect,
+    )
+
+
 def _ensure_paramiko_available() -> None:
     """如果 paramiko 缺失,打针对当前环境的修复提示并退出码 1。"""
     if _runner.paramiko is None:
@@ -190,12 +271,23 @@ def open_command(
         help="最大重试次数(0=无限,仅 --reconnect 时生效)",
         min=0,
     ),
+    last: bool = typer.Option(
+        False,
+        "--last",
+        help="复用上一次的参数(与 --from 互斥)",
+    ),
+    from_name: str = typer.Option(
+        "",
+        "--from",
+        help="从已有后台隧道复制参数(与 --last 互斥)",
+    ),
 ) -> None:
     """建立 SSH 端口转发,前台常驻或后台守护。
 
     不传任何必填参数(主要是 ``--direction``)时,会进入交互表单逐项填写。
+    历史参数会自动预填到交互表单中,减少重复输入。
     """
-    prefill_options = _runner.TunnelOptions(
+    raw_prefill = _runner.TunnelOptions(
         direction=direction,
         ssh_host=ssh_host,
         ssh_user=resolved_user_from_cli(ssh_user),
@@ -213,6 +305,57 @@ def open_command(
         reconnect=reconnect,
         max_reconnect=max_reconnect,
     )
+
+    if last and from_name:
+        console.print("[red]--last 与 --from 不能同时使用[/red]")
+        raise typer.Exit(code=2)
+
+    base_options: _runner.TunnelOptions | None = None
+    if last:
+        history = _state.read_history()
+        if history is None:
+            console.print(
+                "[yellow]没有历史记录。"
+                "请先成功执行一次 tunnel open,或去掉 --last 进入交互模式。[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        base_options = _options_from_history(history)
+    elif from_name:
+        try:
+            base_options = _options_from_spec(from_name)
+        except _state.StateError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+
+    has_direction_source = bool(raw_prefill.direction) or (
+        base_options is not None and bool(base_options.direction)
+    )
+    if base_options is not None:
+        prefill_options = _overlay_options(base_options, raw_prefill)
+    else:
+        prefill_options = raw_prefill
+
+    if not has_direction_source:
+        # 用户没有提供任何方向信息,重置 direction 以触发交互模式
+        prefill_options = _runner.TunnelOptions(
+            direction="",
+            ssh_host=prefill_options.ssh_host,
+            ssh_user=prefill_options.ssh_user,
+            ssh_port=prefill_options.ssh_port,
+            ssh_key=prefill_options.ssh_key,
+            bind_host=prefill_options.bind_host,
+            bind_port=prefill_options.bind_port,
+            target_host=prefill_options.target_host,
+            target_port=prefill_options.target_port,
+            strict_host_key=prefill_options.strict_host_key,
+            name=prefill_options.name,
+            background=prefill_options.background,
+            dry_run=prefill_options.dry_run,
+            ssh_password=prefill_options.ssh_password,
+            reconnect=prefill_options.reconnect,
+            max_reconnect=prefill_options.max_reconnect,
+        )
+
     if not prefill_options.direction:
         try:
             options = _interactive.collect_options(prefill_options)
@@ -260,6 +403,26 @@ def open_command(
             "  2) 改用前台模式(去掉 --background),Ctrl+C 退出"
         )
         raise typer.Exit(code=1)
+
+    if not options.dry_run:
+        _state.write_history(
+            {
+                "direction": options.direction,
+                "ssh_host": options.ssh_host,
+                "ssh_user": options.ssh_user,
+                "ssh_port": options.ssh_port,
+                "ssh_key": options.ssh_key,
+                "bind_host": options.bind_host,
+                "bind_port": options.bind_port,
+                "target_host": options.target_host,
+                "target_port": options.target_port,
+                "strict_host_key": options.strict_host_key,
+                "background": options.background,
+                "reconnect": options.reconnect,
+                "max_reconnect": options.max_reconnect,
+            }
+        )
+
     if options.dry_run:
         _print_open_dry_run(options)
         return

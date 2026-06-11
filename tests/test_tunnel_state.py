@@ -155,3 +155,45 @@ def test_close_spec_removes_state_file_for_dead_process(isolated_state_dir):
     closed = _state.close_spec("dead")
     assert closed is False
     assert not (_state.spec_path("dead")).exists()
+
+
+def test_write_and_read_history_roundtrip(isolated_state_dir):
+    """A history payload written to disk can be read back intact."""
+    payload = {
+        "direction": "local",
+        "ssh_host": "bastion.example.com",
+        "ssh_user": "ops",
+        "ssh_port": 2222,
+        "ssh_key": "/home/ops/.ssh/id_ed25519",
+        "bind_host": "127.0.0.1",
+        "bind_port": 19000,
+        "target_host": "db.internal",
+        "target_port": 5432,
+        "strict_host_key": True,
+        "background": False,
+        "reconnect": True,
+        "max_reconnect": 5,
+    }
+    written_path = _state.write_history(payload)
+    assert written_path == isolated_state_dir / "last_open.json"
+    loaded = _state.read_history()
+    assert loaded is not None
+    assert loaded["direction"] == "local"
+    assert loaded["ssh_port"] == 2222
+    assert loaded["ssh_key"] == "/home/ops/.ssh/id_ed25519"
+    assert loaded["strict_host_key"] is True
+    assert loaded["reconnect"] is True
+    assert loaded["max_reconnect"] == 5
+
+
+def test_read_history_missing_returns_none(isolated_state_dir):
+    """``read_history`` returns ``None`` when the file does not exist."""
+    assert _state.read_history() is None
+
+
+def test_read_history_corrupted_returns_none(isolated_state_dir):
+    """A corrupted history file is treated as absent (``None``)."""
+    isolated_state_dir.mkdir(parents=True, exist_ok=True)
+    history_file = isolated_state_dir / "last_open.json"
+    history_file.write_text("not-json{{", encoding="utf-8")
+    assert _state.read_history() is None

@@ -1,492 +1,109 @@
-"""Typer 命令:``zata-ops tunnel open | list | status | close``,以及后台
-守护使用的隐藏子命令 ``tunnel run``。
+"""Typer 命令:``zata-ops tunnel open | list | status | close``。
 
-设计要点:
-
-- ``open`` 默认前台,``--background`` 时父进程把 spec 写到
-  ``~/.local/share/zata-ops/tunnels/<name>.json``,通过 ``subprocess.Popen``
-  启动 :func:`zata_ops.tunnel._runner.serve_daemon` 并等状态翻成 ``ready``。
-- 缺 ``paramiko`` 时(``ImportError``)给中文友好提示,退出码 1。
-- dry-run 模式只打印 plan,不建立连接也不写状态文件。
+薄壳:把 ``ssh <argv>`` 派生为 detached 子进程,把 pid 和 argv 写到
+``<state_dir>/<name>.json``;``list/close/status`` 读这个目录管理。
+所有 SSH 鉴权 / 转发 / 重连 / 配置文件探测都交给外部 ``ssh`` 进程。
 """
 
 from __future__ import annotations
 
 import json
-import os
+import shlex
 import subprocess
-import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from zata_ops.tunnel import _interactive, _runner, _state
+from zata_ops.tunnel import _state
 
 console = Console()
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
     help=(
-        "SSH 端口转发:local 对应 ssh -L(本机端口 → 远端目标),"
-        "remote 对应 ssh -R(远端端口 → 本机目标)。"
-        "前台常驻用 Ctrl+C 关闭;--background 守护到后台用 tunnel list/close 管理。"
+        "SSH 端口转发的 pid 标签管理器:open 派生 ssh 到后台,"
+        "list/status/close 按名字管理。想做自动重连请用 autossh / systemd --user,"
+        "想要前台直接 `ssh -L`,不必过 zata-ops。"
     ),
 )
 
 
-def _resolve_ssh_user(explicit_user: str) -> str:
-    """Return ``explicit_user`` if non-empty, else ``$USER`` or ``"root"``."""
-    if explicit_user:
-        return explicit_user
-    return os.environ.get("USER") or os.environ.get("USERNAME") or "root"
+def _launch_ssh(ssh_argv: list[str], log_path: Path) -> subprocess.Popen:
+    """Fork the given ``ssh_argv`` as a detached background process.
 
-
-def resolved_user_from_cli(explicit_user: str) -> str:
-    """Public alias for :func:`_resolve_ssh_user` (used in prefill construction)."""
-    return _resolve_ssh_user(explicit_user)
-
-
-def _validate_direction(direction: str) -> None:
-    if direction not in {"local", "remote"}:
-        console.print(
-            f"[red]--direction 必须是 local 或 remote,收到 {direction!r}[/red]"
-        )
-        raise typer.Exit(code=2)
-
-
-def _print_open_dry_run(options: _runner.TunnelOptions) -> None:
-    """Render the dry-run plan in the same style as ``env provision --dry-run``."""
-    console.print("[bold green]zata-ops tunnel open --dry-run[/bold green]")
-    auth_method = (
-        "password"
-        if options.ssh_password
-        else "key"
-        if options.ssh_key
-        else "agent+discovered"
-    )
-    plan_payload = {
-        "direction": options.direction,
-        "ssh": {
-            "host": options.ssh_host,
-            "user": options.ssh_user,
-            "port": options.ssh_port,
-            "auth_method": auth_method,
-            "key": options.ssh_key,
-            "password_set": bool(options.ssh_password),
-            "strict_host_key": options.strict_host_key,
-        },
-        "listen": {"host": options.bind_host, "port": options.bind_port},
-        "target": {"host": options.target_host, "port": options.target_port},
-        "background": options.background,
-        "name": options.name or None,
-        "reconnect": options.reconnect,
-        "max_reconnect": options.max_reconnect,
-        "equivalent_ssh_command": _runner.plan_to_argv_preview(options),
-        "server_requirements": _server_requirements_for(options),
-    }
-    console.print_json(json.dumps(plan_payload, indent=2, ensure_ascii=False))
-
-
-def _server_requirements_for(options: _runner.TunnelOptions) -> list[str]:
-    """返回远端 sshd_config 需要满足的条件,用于 dry-run 提示。"""
-    base_requirements = [
-        "/etc/ssh/sshd_config 需包含: AllowTcpForwarding yes "
-        "(或 local/remote,只要覆盖本命令方向即可)",
-    ]
-    if options.direction == "remote" and options.bind_host not in (
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    ):
-        base_requirements.append(
-            f"--bind-host {options.bind_host} 不是 loopback 地址,"
-            "服务端还需要 GatewayPorts yes 或 GatewayPorts clientspecified "
-            "才会绑定到非 loopback 接口。"
-        )
-    return base_requirements
-
-
-def _spawn_daemon(spec: _state.TunnelSpec) -> subprocess.Popen:
-    """启动 :func:`_runner.serve_daemon` 子进程,stdout/stderr 写到 ``spec.log_path``。"""
-    log_path = Path(spec.log_path)
+    The child gets a new session group (``start_new_session=True``) so it
+    survives the parent's exit. stdout/stderr is appended to ``log_path``;
+    stdin is closed to avoid the child inheriting a TTY.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("ab", buffering=0)
-    spawn_argv = [sys.executable, "-m", "zata_ops", "tunnel", "run", spec.name]
-    spawn_env = os.environ.copy()
-    return subprocess.Popen(  # noqa: S603 - argv 是项目自有入口,非 shell
-        spawn_argv,
+    return subprocess.Popen(  # noqa: S603 - argv is user-supplied; not a shell
+        ssh_argv,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
-        env=spawn_env,
         close_fds=True,
     )
 
 
-def _default_name(direction: str) -> str:
-    """Generate a stable default name like ``local-20260609-163012``."""
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{direction}-{timestamp}"
-
-
-def _options_from_history(history: dict[str, Any]) -> _runner.TunnelOptions:
-    """Build :class:`TunnelOptions` from a history dict."""
-    return _runner.TunnelOptions(
-        direction=history.get("direction", ""),
-        ssh_host=history.get("ssh_host", ""),
-        ssh_user=history.get("ssh_user", ""),
-        ssh_port=history.get("ssh_port", 22),
-        ssh_key=history.get("ssh_key"),
-        bind_host=history.get("bind_host", "127.0.0.1"),
-        bind_port=history.get("bind_port", 0),
-        target_host=history.get("target_host", "127.0.0.1"),
-        target_port=history.get("target_port", 0),
-        strict_host_key=history.get("strict_host_key", False),
-        name="",
-        background=history.get("background", False),
-        dry_run=False,
-        ssh_password=None,
-        reconnect=history.get("reconnect", False),
-        max_reconnect=history.get("max_reconnect", 0),
-    )
-
-
-def _options_from_spec(name: str) -> _runner.TunnelOptions:
-    """Build :class:`TunnelOptions` from an existing background tunnel spec."""
-    spec = _state.load_spec(name)
-    return _runner.TunnelOptions(
-        direction=spec.direction,
-        ssh_host=spec.ssh_host,
-        ssh_user=spec.ssh_user,
-        ssh_port=spec.ssh_port,
-        ssh_key=spec.ssh_key,
-        bind_host=spec.bind_host,
-        bind_port=spec.bind_port,
-        target_host=spec.target_host,
-        target_port=spec.target_port,
-        strict_host_key=spec.strict_host_key,
-        name="",
-        background=False,
-        dry_run=False,
-        ssh_password=None,
-        reconnect=spec.reconnect,
-        max_reconnect=spec.max_reconnect,
-    )
-
-
-def _overlay_options(
-    base: _runner.TunnelOptions, override: _runner.TunnelOptions
-) -> _runner.TunnelOptions:
-    """Merge two options, taking override's non-default values."""
-    return _runner.TunnelOptions(
-        direction=override.direction or base.direction,
-        ssh_host=override.ssh_host or base.ssh_host,
-        ssh_user=(
-            override.ssh_user
-            if override.ssh_user != _resolve_ssh_user("")
-            else base.ssh_user
-        ),
-        ssh_port=override.ssh_port if override.ssh_port != 22 else base.ssh_port,
-        ssh_key=override.ssh_key if override.ssh_key is not None else base.ssh_key,
-        bind_host=override.bind_host
-        if override.bind_host != "127.0.0.1"
-        else base.bind_host,
-        bind_port=override.bind_port if override.bind_port != 0 else base.bind_port,
-        target_host=override.target_host
-        if override.target_host != "127.0.0.1"
-        else base.target_host,
-        target_port=override.target_port
-        if override.target_port != 0
-        else base.target_port,
-        strict_host_key=override.strict_host_key or base.strict_host_key,
-        name=override.name or base.name,
-        background=override.background or base.background,
-        dry_run=override.dry_run or base.dry_run,
-        ssh_password=override.ssh_password or base.ssh_password,
-        reconnect=override.reconnect or base.reconnect,
-        max_reconnect=override.max_reconnect
-        if override.max_reconnect != 0
-        else base.max_reconnect,
-    )
-
-
-def _ensure_paramiko_available() -> None:
-    """如果 paramiko 缺失,打针对当前环境的修复提示并退出码 1。"""
-    if _runner.paramiko is None:
-        # ``[ssh]`` 字面量会被 Rich 当 markup 吞掉,所以用 markup=False
-        # 保持原文(里面包含 ``[ssh]`` / ``[tool]`` 等 PEP 508 extra 写法)。
-        console.print(
-            "[red]paramiko 未安装,无法使用 tunnel 子命令。[/red]\n"
-            + _runner._paramiko_missing_hint(),
-            markup=False,
-        )
-        raise typer.Exit(code=1)
-
-
 @app.command("open")
 def open_command(
-    direction: str = typer.Option(
-        "",
-        "--direction",
-        help="local (-L) 或 remote (-R);不传则进入交互表单",
-    ),
-    ssh_host: str = typer.Option("", help="SSH 跳板机地址"),
-    bind_port: int = typer.Option(0, help="监听端口"),
-    target_port: int = typer.Option(0, help="目标端口"),
-    ssh_user: str = typer.Option("", help="SSH 用户,默认 $USER"),
-    ssh_port: int = typer.Option(22, help="SSH 服务端口"),
-    ssh_key: Optional[str] = typer.Option(
-        None, help="私钥路径(与 --ssh-password 互斥)"
-    ),
-    ssh_password: Optional[str] = typer.Option(
-        None,
-        "--ssh-password",
+    name: str = typer.Argument(..., help="tunnel friendly name (state file basename)"),
+    ssh_argv: list[str] = typer.Argument(
+        ...,
         help=(
-            "SSH 密码(与 --ssh-key 互斥)。前台模式仅内存;后台模式禁用。"
-            " 会进入 shell 历史,生产环境建议改用 ssh-add 注入 ssh-agent。"
+            "ssh argv passed verbatim. The first element must be ``ssh``. "
+            "Example: -- ssh -L 6669:localhost:5432 root@host"
         ),
-        hide_input=True,
-    ),
-    bind_host: str = typer.Option("127.0.0.1", help="监听地址"),
-    target_host: str = typer.Option("127.0.0.1", help="目标主机"),
-    strict_host_key: bool = typer.Option(
-        False, "--strict-host-key", help="严格校验 host key(默认 warn+accept)"
-    ),
-    name: str = typer.Option("", "--name", help="后台实例名(后台模式必填或自动生成)"),
-    background: bool = typer.Option(False, "--background", help="后台守护模式"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="只打印 plan,不建立连接"),
-    reconnect: bool = typer.Option(
-        False,
-        "--reconnect",
-        help="SSH 断了自动重连(指数退避 1s→30s)",
-    ),
-    max_reconnect: int = typer.Option(
-        0,
-        "--max-reconnect",
-        help="最大重试次数(0=无限,仅 --reconnect 时生效)",
-        min=0,
-    ),
-    last: bool = typer.Option(
-        False,
-        "--last",
-        help="复用上一次的参数(与 --from 互斥)",
-    ),
-    from_name: str = typer.Option(
-        "",
-        "--from",
-        help="从已有后台隧道复制参数(与 --last 互斥)",
     ),
 ) -> None:
-    """建立 SSH 端口转发,前台常驻或后台守护。
-
-    不传任何必填参数(主要是 ``--direction``)时,会进入交互表单逐项填写。
-    历史参数会自动预填到交互表单中,减少重复输入。
-    """
-    raw_prefill = _runner.TunnelOptions(
-        direction=direction,
-        ssh_host=ssh_host,
-        ssh_user=resolved_user_from_cli(ssh_user),
-        ssh_port=ssh_port,
-        ssh_key=ssh_key,
-        bind_host=bind_host,
-        bind_port=bind_port,
-        target_host=target_host,
-        target_port=target_port,
-        strict_host_key=strict_host_key,
-        name=name,
-        background=background,
-        dry_run=dry_run,
-        ssh_password=ssh_password,
-        reconnect=reconnect,
-        max_reconnect=max_reconnect,
-    )
-
-    if last and from_name:
-        console.print("[red]--last 与 --from 不能同时使用[/red]")
-        raise typer.Exit(code=2)
-
-    base_options: _runner.TunnelOptions | None = None
-    if last:
-        history = _state.read_history()
-        if history is None:
-            console.print(
-                "[yellow]没有历史记录。"
-                "请先成功执行一次 tunnel open,或去掉 --last 进入交互模式。[/yellow]"
-            )
-            raise typer.Exit(code=1)
-        base_options = _options_from_history(history)
-    elif from_name:
-        try:
-            base_options = _options_from_spec(from_name)
-        except _state.StateError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-
-    has_direction_source = bool(raw_prefill.direction) or (
-        base_options is not None and bool(base_options.direction)
-    )
-    if base_options is not None:
-        prefill_options = _overlay_options(base_options, raw_prefill)
-    else:
-        prefill_options = raw_prefill
-
-    if not has_direction_source:
-        # 用户没有提供任何方向信息,重置 direction 以触发交互模式
-        prefill_options = _runner.TunnelOptions(
-            direction="",
-            ssh_host=prefill_options.ssh_host,
-            ssh_user=prefill_options.ssh_user,
-            ssh_port=prefill_options.ssh_port,
-            ssh_key=prefill_options.ssh_key,
-            bind_host=prefill_options.bind_host,
-            bind_port=prefill_options.bind_port,
-            target_host=prefill_options.target_host,
-            target_port=prefill_options.target_port,
-            strict_host_key=prefill_options.strict_host_key,
-            name=prefill_options.name,
-            background=prefill_options.background,
-            dry_run=prefill_options.dry_run,
-            ssh_password=prefill_options.ssh_password,
-            reconnect=prefill_options.reconnect,
-            max_reconnect=prefill_options.max_reconnect,
-        )
-
-    if not prefill_options.direction:
-        try:
-            options = _interactive.collect_options(prefill_options)
-        except _interactive.FormCancelledError:
-            console.print("[yellow]已取消[/yellow]")
-            raise typer.Exit(code=130) from None
-        except _runner.TunnelError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-    else:
-        _validate_direction(prefill_options.direction)
-        options = prefill_options
-    _ensure_paramiko_available()
-    resolved_name = options.name or (
-        _default_name(options.direction) if options.background else ""
-    )
-    if options.background and not resolved_name:
-        console.print("[red]--background 模式必须指定 --name[/red]")
-        raise typer.Exit(code=2)
-    options = _runner.TunnelOptions(
-        direction=options.direction,
-        ssh_host=options.ssh_host,
-        ssh_user=options.ssh_user,
-        ssh_port=options.ssh_port,
-        ssh_key=options.ssh_key,
-        bind_host=options.bind_host,
-        bind_port=options.bind_port,
-        target_host=options.target_host,
-        target_port=options.target_port,
-        strict_host_key=options.strict_host_key,
-        name=resolved_name,
-        background=options.background,
-        dry_run=options.dry_run,
-        ssh_password=options.ssh_password,
-        reconnect=options.reconnect,
-        max_reconnect=options.max_reconnect,
-    )
-    # 后台模式 + 密码:拒绝,避免明文落盘。推荐用 ssh-add 注入 ssh-agent。
-    if options.background and options.ssh_password:
+    """Run ``ssh <argv>`` in the background and remember it as ``<name>``."""
+    # Validate the name up front so an invalid name doesn't fork ssh first.
+    try:
+        _state.spec_path(name)
+    except _state.StateError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not ssh_argv or ssh_argv[0] != "ssh":
+        first_arg_repr = repr(ssh_argv[0]) if ssh_argv else "(nothing)"
         console.print(
-            "[red]--background 模式与 --ssh-password 互斥:[/red]\n"
-            "后台模式会把 spec 写到 ~/.local/share/zata-ops/tunnels/<name>.json,"
-            "其中若含明文密码就有泄露风险。请二选一:\n"
-            "  1) 用 ssh-add 注入 ssh-agent,再去掉 --ssh-password\n"
-            "  2) 改用前台模式(去掉 --background),Ctrl+C 退出"
+            f"[red]first arg after `--` must be `ssh`, got {first_arg_repr}.[/red]\n"
+            "Example: zata-ops tunnel open db -- ssh -L 6669:localhost:5432 root@host"
         )
-        raise typer.Exit(code=1)
-
-    if not options.dry_run:
-        _state.write_history(
-            {
-                "direction": options.direction,
-                "ssh_host": options.ssh_host,
-                "ssh_user": options.ssh_user,
-                "ssh_port": options.ssh_port,
-                "ssh_key": options.ssh_key,
-                "bind_host": options.bind_host,
-                "bind_port": options.bind_port,
-                "target_host": options.target_host,
-                "target_port": options.target_port,
-                "strict_host_key": options.strict_host_key,
-                "background": options.background,
-                "reconnect": options.reconnect,
-                "max_reconnect": options.max_reconnect,
-            }
+        raise typer.Exit(code=2)
+    log_path = _state.state_dir() / f"{name}.log"
+    try:
+        child_process = _launch_ssh(ssh_argv, log_path)
+    except FileNotFoundError as exc:
+        console.print(
+            f"[red]failed to exec {ssh_argv[0]!r}: {exc}.[/red]\n"
+            "Is `ssh` on your $PATH? On Windows, install OpenSSH via Settings → "
+            "Apps → Optional features, or use WSL."
         )
-
-    if options.dry_run:
-        _print_open_dry_run(options)
-        return
-    if not options.background:
-        try:
-            _runner.serve_foreground(options)
-        except _runner.TunnelError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-        except KeyboardInterrupt:
-            console.print("[yellow]Tunnel closed by Ctrl+C[/yellow]")
-            return
-        return
-    # 后台模式
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        console.print(f"[red]failed to spawn ssh: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
     spec = _state.TunnelSpec(
-        name=resolved_name,
-        direction=options.direction,
-        bind_host=options.bind_host,
-        bind_port=options.bind_port,
-        target_host=options.target_host,
-        target_port=options.target_port,
-        ssh_host=options.ssh_host,
-        ssh_user=options.ssh_user,
-        ssh_port=options.ssh_port,
-        ssh_key=options.ssh_key,
-        strict_host_key=options.strict_host_key,
-        pid=0,
-        log_path="",
+        name=name,
+        pid=child_process.pid,
+        ssh_argv=ssh_argv,
+        log_path=str(log_path),
         started_at=_state.now_iso(),
-        state="pending",
-        reconnect=options.reconnect,
-        max_reconnect=options.max_reconnect,
     )
-    spec.log_path = str(_state.state_dir() / f"{spec.name}.log")
-    _state.write_spec(spec)
-    child = _spawn_daemon(spec)
-    spec.pid = child.pid
     _state.write_spec(spec)
     console.print(
-        f"[green]Spawned tunnel '{spec.name}' (pid {child.pid}); "
-        f"log: {spec.log_path}[/green]"
-    )
-    if not _state.wait_for_ready(spec.name):
-        console.print(
-            f"[red]Tunnel '{spec.name}' 启动超时({int(_state.READY_WAIT_SECONDS)}s),"
-            f"请查看 {spec.log_path} 排查。[/red]"
-        )
-        try:
-            child.terminate()
-        except OSError:
-            pass
-        raise typer.Exit(code=1)
-    final_spec = _state.load_spec(spec.name)
-    console.print(
-        f"[green]Tunnel '{final_spec.name}' is ready "
-        f"({final_spec.direction}: "
-        f"{final_spec.bind_host}:{final_spec.bind_port} -> "
-        f"{final_spec.target_host}:{final_spec.target_port})[/green]"
+        f"[green]Spawned tunnel '{name}' (pid {child_process.pid}); "
+        f"log: {log_path}[/green]"
     )
 
 
 @app.command("list")
 def list_command() -> None:
-    """列出所有后台隧道实例。"""
+    """列出所有后台 ssh 隧道实例。"""
     try:
         live_specs = _state.list_specs()
     except _state.StateError as exc:
@@ -497,22 +114,14 @@ def list_command() -> None:
         return
     table = Table(title="Background tunnels", show_lines=False)
     table.add_column("NAME", style="cyan")
-    table.add_column("DIR")
-    table.add_column("BIND", style="green")
-    table.add_column("TARGET", style="green")
-    table.add_column("SSH", style="magenta")
     table.add_column("PID", justify="right")
-    table.add_column("STATE")
+    table.add_column("ARGV", style="green")
     table.add_column("STARTED")
     for spec in live_specs:
         table.add_row(
             spec.name,
-            spec.direction,
-            f"{spec.bind_host}:{spec.bind_port}",
-            f"{spec.target_host}:{spec.target_port}",
-            f"{spec.ssh_user}@{spec.ssh_host}:{spec.ssh_port}",
             str(spec.pid),
-            spec.state,
+            " ".join(shlex.quote(part) for part in spec.ssh_argv),
             spec.started_at,
         )
     console.print(table)
@@ -520,9 +129,9 @@ def list_command() -> None:
 
 @app.command("status")
 def status_command(
-    name: str = typer.Argument(..., help="后台实例名"),
+    name: str = typer.Argument(..., help="tunnel name"),
 ) -> None:
-    """显示单个后台实例的明细 + 最近日志。"""
+    """显示单个后台实例的明细 + 最近 20 行日志。"""
     try:
         spec = _state.load_spec(name)
     except _state.StateError as exc:
@@ -535,9 +144,8 @@ def status_command(
         except FileNotFoundError:
             pass
         raise typer.Exit(code=1)
-    spec_dict = spec.to_dict()
     console.print(f"[bold]Tunnel '{name}'[/bold]")
-    console.print_json(json.dumps(spec_dict, indent=2, ensure_ascii=False))
+    console.print_json(json.dumps(spec.to_dict(), indent=2, ensure_ascii=False))
     if spec.log_path and Path(spec.log_path).is_file():
         log_text = Path(spec.log_path).read_text(encoding="utf-8", errors="replace")
         tail_lines = log_text.splitlines()[-20:]
@@ -548,9 +156,9 @@ def status_command(
 
 @app.command("close")
 def close_command(
-    name: str = typer.Argument(..., help="后台实例名"),
+    name: str = typer.Argument(..., help="tunnel name"),
 ) -> None:
-    """停止一个后台隧道实例。"""
+    """停止一个后台 ssh 隧道实例。"""
     try:
         stopped = _state.close_spec(name)
     except _state.StateError as exc:
@@ -560,15 +168,3 @@ def close_command(
         console.print(f"[green]Tunnel '{name}' 已停止。[/green]")
     else:
         console.print(f"[yellow]Tunnel '{name}' 未在运行,清理状态。[/yellow]")
-
-
-@app.command("run", hidden=True)
-def run_command(
-    spec_name: str = typer.Argument(..., help="spec 文件名(spec.name)"),
-) -> None:
-    """隐藏入口:由 ``tunnel open --background`` 派生的子进程执行。"""
-    try:
-        _runner.serve_daemon(spec_name)
-    except _runner.TunnelError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1) from exc

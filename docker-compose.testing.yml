@@ -16,6 +16,8 @@
 #   S3_SECRET_KEY=minioadmin
 #   S3_BUCKET=app-backups
 #   QDRANT_URL=http://localhost:6333
+#   RAGFLOW_BASE_URL=http://localhost:9380
+#   RAGFLOW_API_KEY=test-ragflow-key
 #
 # MinIO 启动后需手动创建 bucket（Console: http://localhost:9001，minioadmin/minioadmin）
 # -----------------------------------------------------------------------------
@@ -94,7 +96,68 @@ services:
       - qdrant-test-data:/qdrant/storage
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # MySQL 8 — RAGflow 元数据后端（内部依赖）
+  # ---------------------------------------------------------------------------
+  # RAGflow 硬依赖：默认连 service name `mysql:3306`。
+  # 只为 RAGflow 服务，端口不暴露给 app（app 不直连）。
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: test-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test-ragflow-pass
+      MYSQL_DATABASE: rag_flow
+    volumes:
+      - mysql-test-data:/var/lib/mysql
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Infinity — RAGflow 向量 / 全文检索后端（内部依赖）
+  # ---------------------------------------------------------------------------
+  # RAGflow 硬依赖：默认连 service name `infinity:9000`。
+  # 只为 RAGflow 服务，端口不暴露给 app。
+  # ---------------------------------------------------------------------------
+  infinity:
+    image: infiniflow/infinity:latest
+    container_name: test-infinity
+    volumes:
+      - infinity-test-data:/var/lib/infinity
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # RAGflow — RAG Pipeline Service
+  # ---------------------------------------------------------------------------
+  # 用于本地测试 RAGflow 作为第二个检索引擎。
+  # REST API: http://localhost:9380
+  #
+  # 适配说明（与生产 deploy/ragflow 差异）：
+  #   - 明文 env，测试用 API key 直接 inline（生产请用 app.env + secrets）
+  #   - 端口直接暴露到 localhost，不挂 external Traefik
+  #   - 无 deploy.resources 限制
+  #
+  # 依赖（已在本 compose 内就绪）：
+  #   - MySQL        → service `mysql`     （元数据）
+  #   - Infinity     → service `infinity`  （向量 / BM25）
+  #   - Redis        → service `redis`     （缓存）
+  #   - MinIO        → service `minio`     （原始文件）
+  # 启动顺序：mysql / infinity / redis / minio 先 up，RAGflow 会等它们就绪后初始化。
+  # ---------------------------------------------------------------------------
+  ragflow:
+    image: infiniflow/ragflow:latest
+    container_name: test-ragflow
+    ports:
+      - "9380:9380"
+    environment:
+      RAGFLOW_API_KEY: test-ragflow-key
+    volumes:
+      - ragflow-test-data:/ragflow/data
+    restart: unless-stopped
+
 volumes:
   minio-test-data:
   postgres-test-data:
   qdrant-test-data:
+  ragflow-test-data:
+  mysql-test-data:
+  infinity-test-data:

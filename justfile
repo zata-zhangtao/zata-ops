@@ -339,3 +339,63 @@ frontend action="dev":
             exit 1
             ;;
     esac
+
+
+# ── Local Testing Middleware ──────────────────────────────────────────────────
+
+# Manage the local testing middleware stack (docker-compose.testing.yml).
+# Usage:
+#   just testing                     # show running services (no side effects)
+#   just testing up                  # apply compose changes / start all
+#   just testing up ragflow          # apply / start a single service
+#   just testing restart ragflow     # restart a service without rebuilding
+#   just testing recreate ragflow    # force-recreate (picks up new image)
+#   just testing recreate            # force-recreate all services
+#   just testing down                # stop and remove the stack
+testing action="ps" service="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}
+    compose_file="docker-compose.testing.yml"
+
+    case "{{action}}" in
+        ps)
+            docker compose -f "$compose_file" ps
+            ;;
+        up)
+            if [ -n "{{service}}" ]; then
+                echo "Starting '{{service}}' from $compose_file"
+                docker compose -f "$compose_file" up -d "{{service}}"
+            else
+                echo "Starting all services from $compose_file"
+                docker compose -f "$compose_file" up -d
+            fi
+            ;;
+        restart)
+            if [ -n "{{service}}" ]; then
+                echo "Restarting '{{service}}'"
+                docker compose -f "$compose_file" restart "{{service}}"
+            else
+                echo "Restarting all services"
+                docker compose -f "$compose_file" restart
+            fi
+            ;;
+        recreate)
+            if [ -n "{{service}}" ]; then
+                echo "Force-recreating '{{service}}'"
+                docker compose -f "$compose_file" up -d --force-recreate "{{service}}"
+            else
+                echo "Force-recreating all services"
+                docker compose -f "$compose_file" up -d --force-recreate
+            fi
+            ;;
+        down)
+            echo "Stopping and removing the $compose_file stack"
+            docker compose -f "$compose_file" down
+            ;;
+        *)
+            echo "ERROR: Unknown testing action: {{action}}"
+            echo "Usage: just testing [ps|up|restart|recreate|down] [service]"
+            exit 1
+            ;;
+    esac

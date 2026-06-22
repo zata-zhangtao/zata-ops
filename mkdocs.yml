@@ -41,6 +41,8 @@ nav:
       - 调度示例: guides/scheduling.md
       - VPS 初始化: guides/vps-provisioning.md
       - SSH 隧道: guides/tunnel.md
+  - 系统架构:
+      - 监控栈: architecture/monitoring-stack.md
   - AI 规范:
       - 概览: ai-standards/index.md
       - 架构规范: ai-standards/architecture.md

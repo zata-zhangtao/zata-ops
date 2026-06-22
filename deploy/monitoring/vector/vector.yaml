@@ -1,0 +1,71 @@
+# -----------------------------------------------------------------------------
+# Vector configuration: collect Docker container logs and forward to Loki.
+# -----------------------------------------------------------------------------
+# The `docker_logs` source reads stdout/stderr from all running containers via
+# the Docker API. The JSON parser extracts structured fields emitted by the
+# application; low-cardinality labels are attached before shipping to Loki.
+# -----------------------------------------------------------------------------
+
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+
+sources:
+  docker_logs:
+    type: docker_logs
+    docker_host: unix:///var/run/docker.sock
+    include_containers: []
+    exclude_containers: []
+    # Collect logs from all images. Use include_images/exclude_images to filter.
+    include_images:
+      - "*"
+
+transforms:
+  parse_app_json:
+    type: remap
+    inputs: ["docker_logs"]
+    source: |
+      # Try to parse the message as JSON. If it fails, leave it as raw text.
+      parsed, err = parse_json(.message)
+      if err == null {
+        . = merge!(., parsed)
+      }
+
+      # Extract Docker Compose labels when available.
+      compose_project = "unknown"
+      compose_service = "unknown"
+      if exists(.label."com.docker.compose.project") {
+        compose_project = .label."com.docker.compose.project"
+      }
+      if exists(.label."com.docker.compose.service") {
+        compose_service = .label."com.docker.compose.service"
+      }
+      .compose_project = compose_project
+      .compose_service = compose_service
+
+      # Prefer the service_name emitted by the application; fall back to the
+      # Compose service name so logs always carry a usable identifier.
+      service_name = compose_service
+      if exists(.service_name) {
+        service_name = .service_name
+      }
+      .service_name = service_name
+
+      # Normalize level if present.
+      if !exists(.level) {
+        .level = "info"
+      }
+
+sinks:
+  loki:
+    type: loki
+    inputs: ["parse_app_json"]
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+    labels:
+      compose_project: "{{ compose_project }}"
+      compose_service: "{{ compose_service }}"
+      service_name: "{{ service_name }}"
+      level: "{{ level }}"
+    out_of_order_action: accept

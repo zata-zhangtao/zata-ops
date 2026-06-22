@@ -104,10 +104,21 @@ zata-ops db restore --from 2026-06-07_180000 --restore-db --yes
 zata-ops env provision --host example.com --user deploy --dry-run
 zata-ops env provision --host example.com --user deploy
 
+# 同时部署监控栈(Vector + Loki + Prometheus + Grafana)
+zata-ops env provision \
+  --host example.com \
+  --user deploy \
+  --acme-email ops@example.com \
+  --with-monitoring \
+  --monitoring-domain example.com \
+  --dry-run
+
 # 修复 Traefik 的 ACME 邮箱并强制重新签发证书
 zata-ops env fix --host example.com --email ops@example.com --dry-run
 zata-ops env fix --host example.com --email ops@example.com
 ```
+
+详细监控栈说明见 [监控栈文档](docs/architecture/monitoring-stack.md)。
 
 ### 日志 `logs`
 

@@ -9,11 +9,15 @@ path for users who want zata-ops to drive the actual install.
 
 from __future__ import annotations
 
+import base64
+import io
 import shlex
 import shutil
 import subprocess
+import tarfile
 from dataclasses import dataclass, field
 from importlib import resources
+from pathlib import Path
 from typing import Any
 
 
@@ -59,6 +63,8 @@ def build_provision_plan(
     profile: str,
     acme_email: str | None,
     traefik_network: str,
+    with_monitoring: bool = False,
+    monitoring_domain: str | None = None,
 ) -> dict[str, Any]:
     """Build a dry-run plan describing the upcoming provisioning run.
 
@@ -69,12 +75,65 @@ def build_provision_plan(
         profile: Provisioning profile (e.g. ``vps-traefik``).
         acme_email: Optional ACME email for Let's Encrypt.
         traefik_network: Traefik Docker network name.
+        with_monitoring: Whether to deploy the bundled monitoring stack.
+        monitoring_domain: Domain used for Grafana Traefik routing.
 
     Returns:
         Structured plan, including the rendered shell scripts.
     """
     install_traefik_script = load_shell_template("install-docker-traefik.sh")
     bootstrap_script = load_shell_template("bootstrap.sh")
+    remote_commands: list[dict[str, Any]] = [
+        {
+            "description": "Install Docker + Traefik on the remote host",
+            "argv": _build_remote_argv(
+                user=user,
+                host=host,
+                ssh_key=ssh_key,
+                inline_script=install_traefik_script,
+                env={
+                    "TRAEFIK_NETWORK": traefik_network,
+                    **({"ACME_EMAIL": acme_email} if acme_email else {}),
+                },
+            ),
+        },
+    ]
+
+    if with_monitoring:
+        monitoring_bundle_b64 = _pack_monitoring_bundle()
+        deploy_monitoring_script = _build_deploy_monitoring_script(
+            bundle_b64=monitoring_bundle_b64,
+            traefik_network=traefik_network,
+            domain=monitoring_domain or _derive_monitoring_domain(acme_email),
+        )
+        remote_commands.append(
+            {
+                "description": "Deploy Vector + Loki + Prometheus + Grafana stack",
+                "argv": _build_remote_argv(
+                    user=user,
+                    host=host,
+                    ssh_key=ssh_key,
+                    inline_script=deploy_monitoring_script,
+                    env={
+                        "TRAEFIK_NETWORK": traefik_network,
+                        "DOMAIN": monitoring_domain
+                        or _derive_monitoring_domain(acme_email),
+                    },
+                ),
+            }
+        )
+
+    remote_commands.append(
+        {
+            "description": (
+                "bootstrap.sh is intended to run locally; copy it to a "
+                "workstation with SSH access and execute manually if you "
+                "want zata-ops to skip the deploy-user setup step."
+            ),
+            "script_length_bytes": len(bootstrap_script),
+        },
+    )
+
     return {
         "profile": profile,
         "host": host,
@@ -82,30 +141,86 @@ def build_provision_plan(
         "ssh_key": ssh_key,
         "traefik_network": traefik_network,
         "acme_email": acme_email,
-        "remote_commands": [
-            {
-                "description": "Install Docker + Traefik on the remote host",
-                "argv": _build_remote_argv(
-                    user=user,
-                    host=host,
-                    ssh_key=ssh_key,
-                    inline_script=install_traefik_script,
-                    env={
-                        "TRAEFIK_NETWORK": traefik_network,
-                        **({"ACME_EMAIL": acme_email} if acme_email else {}),
-                    },
-                ),
-            },
-            {
-                "description": (
-                    "bootstrap.sh is intended to run locally; copy it to a "
-                    "workstation with SSH access and execute manually if you "
-                    "want zata-ops to skip the deploy-user setup step."
-                ),
-                "script_length_bytes": len(bootstrap_script),
-            },
-        ],
+        "with_monitoring": with_monitoring,
+        "monitoring_domain": monitoring_domain,
+        "remote_commands": remote_commands,
     }
+
+
+def _derive_monitoring_domain(acme_email: str | None) -> str:
+    """Return a placeholder domain for Grafana when none is provided.
+
+    The monitoring stack requires a ``DOMAIN`` value for Traefik routing. In a
+    real deployment the caller should pass ``--monitoring-domain``; this helper
+    only keeps dry-run output valid when no domain has been supplied.
+    """
+    if acme_email and "@" in acme_email:
+        return f"example.{acme_email.split('@', 1)[1]}"
+    return "example.com"
+
+
+def _pack_monitoring_bundle() -> str:
+    """Pack ``deploy/monitoring/`` into a base64-encoded gzip tarball.
+
+    Returns:
+        Base64 string of the tarball, suitable for embedding in a shell script.
+    """
+    runner_path = Path(__file__).resolve()
+    monitoring_dir = runner_path.parents[3] / "deploy" / "monitoring"
+    if not monitoring_dir.is_dir():
+        raise FileNotFoundError(
+            f"Monitoring bundle directory not found: {monitoring_dir}"
+        )
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        tar.add(monitoring_dir, arcname="monitoring")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _build_deploy_monitoring_script(
+    *,
+    bundle_b64: str,
+    traefik_network: str,
+    domain: str,
+) -> str:
+    """Render the inline bash script that deploys the monitoring stack.
+
+    The script unpacks the bundled ``deploy/monitoring/`` configuration onto
+    ``/opt/apps/monitoring`` and starts the stack with Docker Compose.
+    """
+    return f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MONITORING_DIR="/opt/apps/monitoring"
+BUNDLE_B64='{bundle_b64}'
+DOMAIN="{domain}"
+TRAEFIK_NETWORK="{traefik_network}"
+
+log() {{
+  printf '\\n[%s] %s\\n' "$(date +'%H:%M:%S')" "$*"
+}}
+
+log "创建监控栈目录：$MONITORING_DIR"
+mkdir -p "$MONITORING_DIR"
+cd "$MONITORING_DIR"
+
+log "解压监控栈配置..."
+echo "$BUNDLE_B64" | base64 -d | tar -xzf - --strip-components=1 -C "$MONITORING_DIR"
+
+log "写入环境变量..."
+cat > "$MONITORING_DIR/.env" <<EOF
+DOMAIN=$DOMAIN
+TRAEFIK_NETWORK=$TRAEFIK_NETWORK
+GRAFANA_ROOT_URL=https://grafana.$DOMAIN
+GF_SECURITY_ADMIN_PASSWORD=admin
+EOF
+
+log "启动监控栈..."
+docker compose up -d
+
+log "监控栈部署完成。Grafana: https://grafana.$DOMAIN"
+"""
 
 
 def build_fix_plan(

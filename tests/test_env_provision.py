@@ -65,3 +65,39 @@ def test_env_fix_dry_run_includes_email_arg() -> None:
     )
     assert fix_result.exit_code == 0
     assert "ops@example.com" in fix_result.stdout
+
+
+def test_env_provision_with_monitoring_dry_run_includes_monitoring_deploy() -> None:
+    runner = CliRunner()
+    provision_result = runner.invoke(
+        app,
+        [
+            "env",
+            "provision",
+            "--host",
+            "example.com",
+            "--user",
+            "deploy",
+            "--profile",
+            "vps-traefik",
+            "--acme-email",
+            "ops@example.com",
+            "--with-monitoring",
+            "--dry-run",
+        ],
+    )
+    assert provision_result.exit_code == 0
+    plan_payload = json.loads(
+        provision_result.stdout.split("dry-run[/bold green]", 1)[-1].strip()
+        if "dry-run[/bold green]" in provision_result.stdout
+        else provision_result.stdout.split("\n", 1)[1]
+    )
+    assert plan_payload["with_monitoring"] is True
+    monitoring_commands = [
+        command_entry
+        for command_entry in plan_payload["remote_commands"]
+        if "Vector" in command_entry.get("description", "")
+    ]
+    assert monitoring_commands
+    assert "Grafana" in monitoring_commands[0]["description"]
+    assert "/opt/apps/monitoring" in monitoring_commands[0]["argv"][-1]

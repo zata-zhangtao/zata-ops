@@ -28,6 +28,16 @@ def provision_command(
     acme_email: Optional[str] = typer.Option(
         None, help="Real email for Let's Encrypt (skip to use HTTP only)."
     ),
+    with_monitoring: bool = typer.Option(
+        False,
+        "--with-monitoring",
+        help="Also deploy the Vector + Loki + Prometheus + Grafana monitoring stack.",
+    ),
+    monitoring_domain: Optional[str] = typer.Option(
+        None,
+        "--monitoring-domain",
+        help="Domain used for Grafana Traefik routing. Defaults to the parent of the first app domain if not set.",
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the planned remote commands and exit."
     ),
@@ -49,6 +59,8 @@ def provision_command(
         profile=profile,
         acme_email=acme_email,
         traefik_network=traefik_network,
+        with_monitoring=with_monitoring,
+        monitoring_domain=monitoring_domain,
     )
 
     if dry_run:
